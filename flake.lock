@@ -1,0 +1,106 @@
+{
+  "nodes": {
+    "kit": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1792256383,
+        "narHash": "sha256-YP8ciJBIbJZhX7z2w8Dhelft1kTfIoK7+1BBMIWB/oE=",
+        "ref": "main",
+        "rev": "abe07c7d509a0199cc7fec15263be2aa52ac652f",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10"
+      },
+      "original": {
+        "ref": "main",
+        "rev": "abe07c7d509a0199cc7fec15263be2aa52ac652f",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10"
+      }
+    },
+    "model": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1792495618,
+        "narHash": "sha256-bGZmT3DwRRdzNs/3j347PPqysfe5Eb+rAnOw9DQGPOQ=",
+        "ref": "main",
+        "rev": "45ee5d0fd106c94a3d77f721e09cbb2f50e5a16b",
+        "revCount": 4,
+        "type": "git",
+        "url": "https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw"
+      },
+      "original": {
+        "ref": "main",
+        "rev": "45ee5d0fd106c94a3d77f721e09cbb2f50e5a16b",
+        "type": "git",
+        "url": "https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1792502884,
+        "narHash": "sha256-IoNisKcGbUjdd45qCqywGMCYmZ5EnkxezvLII0FWwNA=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "02c087f3fe673c9e317f206a627cb6b910336dbe",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "kit": "kit",
+        "model": "model",
+        "nixpkgs": "nixpkgs",
+        "tensorfold": "tensorfold",
+        "tensorfold-inputs": "tensorfold-inputs"
+      }
+    },
+    "tensorfold": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1792413252,
+        "narHash": "sha256-td3CunqlHqtdtlFPK4fCvqQSkHgijuRPw46wjg0Icn4=",
+        "ref": "deepseek-v41-zig",
+        "rev": "629c524a0ea57512a5342abb498d1b7c25353343",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/bertholomus/TensorFold"
+      },
+      "original": {
+        "ref": "deepseek-v41-zig",
+        "rev": "629c524a0ea57512a5342abb498d1b7c25353343",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/bertholomus/TensorFold"
+      }
+    },
+    "tensorfold-inputs": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1791566713,
+        "narHash": "sha256-ueQmnkeww6KrNvCoO0ePQLvka2VQ6GJPHOn/fR7ok9s=",
+        "ref": "deepseek-v41-zig-tp4",
+        "rev": "59402086381a42c74d53053443224eec2790b4c5",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/bertholomus/TensorFold"
+      },
+      "original": {
+        "ref": "deepseek-v41-zig-tp4",
+        "rev": "59402086381a42c74d53053443224eec2790b4c5",
+        "shallow": true,
+        "type": "git",
+        "url": "https://github.com/bertholomus/TensorFold"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

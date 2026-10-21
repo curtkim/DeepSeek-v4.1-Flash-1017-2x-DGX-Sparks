@@ -14,6 +14,9 @@ or off, and **DSpark** speculative decoding from the checkpoint's own draft bloc
 [`Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw`](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw)
 (196 GiB; experimental: its model card has no perplexity or KL measurement against the unquantized model).
 
+> Without docker: `nix build` compiles the same engine from `flake.nix`, and `bin/check`, `bin/prepare`, `bin/start` and
+> `bin/stop` serve it as plain processes ([README-nix.md](README-nix.md)).
+
 - Checkpoint: `Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw` (39 shards, routed experts at 3 bits a
   weight, 2 bits in layers 18-22, attention at 5, shared experts at 4-5, head at 6, DSpark blocks at 4; the vision tower
   and the DSpark blocks are in it; the revision is pinned in `scripts/config.sh`), plus Engram's two tables, unquantized,

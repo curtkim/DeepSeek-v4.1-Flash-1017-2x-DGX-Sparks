@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# Check both Sparks for what serving without docker needs, change nothing, and say how to fix what is missing:
+#   - nix (with flakes), aarch64, the NVIDIA driver (nvidia-smi, libcuda.so.1 where the engine's wrapper looks for it)
+#   - locked memory: docker gave the ranks `--ulimit memlock=-1`; without it RDMA cannot register the buffers, so the hard
+#     limit must be unlimited (/etc/security/limits.d); the RoCE devices (/dev/infiniband/uverbs*) readable and writable
+#   - systemd-logind's KillUserProcesses off on the worker (rank 1 outlives the ssh session that starts it)
+#   - key-based ssh to WORKER, the CX7 link and its RoCE devices and GIDs (scripts/nodes.sh)
+#   - the worker's copy (the default): ssh to its address on the link (rsync goes that way), its free disk; or, with
+#     WORKER_HF_MOUNT set, it sees this Spark's HF_CACHE there over NFS, and the export here
+#   - memory available (MIN_AVAIL_GIB), free disk, the port
+#   - the engine: built here (and current with flake.nix, flake.lock and zig/patches), the same store path on the worker, and
+#     both run it (`tensorfold-native capabilities`); bin/prepare's marker
+# Usage: bin/check      exit status 1 when anything FAILs (a WARN alone is 0)
+set -euo pipefail
+source "$(dirname "$(readlink -f "$0")")/lib.sh"
+case "${1:-}" in -h|--help) usage; exit 0 ;; "") ;; *) die "unknown argument: $1" ;; esac
+
+G=$'\033[1;32m'; Y=$'\033[1;33m'; Rd=$'\033[1;31m'; D=$'\033[2m'; R=$'\033[0m'
+[[ -t 1 ]] || { G=; Y=; Rd=; D=; R=; }
+nfail=0; nwarn=0
+# report <where> <OK|WARN|FAIL> <text> [fix]
+report() {
+  local c=$G; [[ $2 == WARN ]] && { c=$Y; nwarn=$((nwarn + 1)); }; [[ $2 == FAIL ]] && { c=$Rd; nfail=$((nfail + 1)); }
+  printf '%s%-4s%s %-14s %s\n' "$c" "$2" "$R" "$1" "$3"
+  [[ -z "${4:-}" ]] || printf '     %-14s %s↳ %s%s\n' "" "$D" "$4" "$R"
+}
+
+# node_checks <engine or -> <min avail GiB> <dir...>: one node's own checks, as "STATUS<TAB>text<TAB>fix" lines.
+# Self-contained: it runs on the worker too (its definition is sent over ssh).
+node_checks() {
+  local engine=$1 min=$2; shift 2
+  local d f v nb drv hard avail
+  out() { printf '%s\t%s\t%s\n' "$1" "$2" "${3:-}"; }
+  v=$(uname -m); [[ "$v" == aarch64 ]] && out OK "arch $v" || out WARN "arch $v (a DGX Spark is aarch64)"
+  nb=""; for d in /run/current-system/sw/bin /nix/var/nix/profiles/default/bin "$HOME/.nix-profile/bin"; do [[ -x $d/nix ]] && { nb=$d; break; }; done
+  [[ -n "$nb" ]] || { d=$(command -v nix 2>/dev/null) && nb=$(dirname "$d"); }
+  if [[ -n "$nb" ]]; then out OK "nix $("$nb/nix" --version 2>/dev/null | awk '{print $NF}') ($nb)"
+  else out FAIL "no nix" "install nix (https://nixos.org/download, multi-user)"; fi
+  if nvidia-smi -L >/dev/null 2>&1; then out OK "GPU: $(nvidia-smi -L 2>/dev/null | head -1 | cut -c1-60)"
+  else out FAIL "nvidia-smi failed" "the NVIDIA driver is not working"; fi
+  drv=${TF_DRIVER_LIB_DIR:-}
+  if [[ -z "$drv" ]]; then
+    [[ -e /run/opengl-driver/lib/libcuda.so.1 ]] && drv=/run/opengl-driver/lib
+    for d in /usr/lib/aarch64-linux-gnu /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/lib /usr/local/nvidia/lib64; do
+      [[ -z "$drv" && -e $d/libcuda.so.1 ]] && drv=$d
+    done
+  fi
+  if [[ -n "$drv" && -e "$drv/libcuda.so.1" ]]; then out OK "driver: $drv/libcuda.so.1 -> $(readlink -f "$drv/libcuda.so.1" | sed 's|.*/||')"
+  else out FAIL "no libcuda.so.1 where the engine looks" "set TF_DRIVER_LIB_DIR to the folder that holds it (scripts/local.sh)"; fi
+  hard=$(ulimit -H -l)
+  if [[ "$hard" == unlimited ]]; then out OK "locked memory: hard limit unlimited"
+  else out FAIL "locked memory: hard limit $hard KiB (docker gave the ranks unlimited; RDMA registers the GPU's buffers)" \
+    "sudo tee /etc/security/limits.d/90-dsv41.conf <<< '$(id -un) - memlock unlimited', then log in again (ssh too)"; fi
+  if compgen -G '/dev/infiniband/uverbs*' >/dev/null; then
+    f=1; for d in /dev/infiniband/uverbs*; do [[ -r $d && -w $d ]] || f=0; done
+    (( f )) && out OK "RoCE: $(ls /dev/infiniband/ | grep -c uverbs) uverbs devices, read-write" ||
+      out FAIL "RoCE: /dev/infiniband/uverbs* not read-write for $(id -un)" "rdma-core's udev rules give them mode 0666 (sudo apt install rdma-core)"
+  else out WARN "RoCE: no /dev/infiniband/uverbs* (RDMA=0 and NCCL over sockets only)"; fi
+  v=$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager KillUserProcesses 2>/dev/null | awk '{print $2}')
+  [[ "$v" == true ]] && out WARN "systemd-logind kills a user's processes at logout (KillUserProcesses=yes): a rank started over ssh dies with it" \
+    "KillUserProcesses=no in /etc/systemd/logind.conf, or: sudo loginctl enable-linger $(id -un)"
+  avail=$(awk '/^MemAvailable:/ {printf "%.1f", $2 / 1048576}' /proc/meminfo)
+  if awk -v a="$avail" -v m="$min" 'BEGIN {exit !(m == 0 || a >= m)}'; then out OK "memory: $avail GiB available (needs $min)"
+  else out WARN "memory: $avail GiB available, a start needs $min (the weights plus the engine's reserve)" "stop other GPU work, desktop sessions or containers"; fi
+  for d in "$@"; do
+    while [[ ! -e "$d" && "$d" != / ]]; do d=$(dirname "$d"); done
+    out OK "disk: $(df -h --output=avail "$d" | tail -1 | tr -d ' ') free at $d"
+  done
+  if [[ "$engine" == - ]]; then :
+  elif [[ ! -x "$engine/bin/tensorfold-native" ]]; then out FAIL "engine: $engine is not here" "bin/prepare builds and copies it"
+  elif "$engine/bin/tensorfold-native" capabilities --json >/dev/null 2>&1; then out OK "engine runs: $engine"
+  else out FAIL "engine at $engine does not run: $("$engine/bin/tensorfold-native" capabilities --json 2>&1 | tail -1 | cut -c1-120)"; fi
+  return 0
+}
+emit() { local where=$1 s t fx; while IFS=$'\t' read -r s t fx; do [[ -z "$s" ]] || report "$where" "$s" "$t" "$fx"; done; return 0; }
+
+engine_paths || ENGINE="-"
+printf '%sChecking this Spark (rank 0) and %s (rank 1) for bin/start (no docker)%s\n\n' "$D" "${WORKER:-<WORKER unset>}" "$R"
+
+# ---------------------------------------------------------------- this Spark
+emit "here" < <(node_checks "$ENGINE" "$MIN_AVAIL_GIB" "$HF_CACHE")
+if [[ "$ENGINE" == - ]]; then report here FAIL "engine: not built yet" "bin/prepare (nix build .#tensorfold)"
+else
+  want=$(engine_wanted || true)
+  if [[ -z "$want" ]]; then report here WARN "engine: could not evaluate the flake (nix eval .#tensorfold.outPath)"
+  elif [[ "$want" != "$ENGINE" ]]; then report here WARN "engine: built from another flake.nix / flake.lock / zig/patches than now" "bin/prepare rebuilds it ($want)"
+  else report here OK "engine is the flake's (TensorFold ${TF_REF:0:8} + patches)"; fi
+fi
+if ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; then
+  if rank_alive_here; then report here OK "port $PORT: rank 0 serves it (pid $(rank_pid_here))"
+  else report here WARN "port $PORT is in use by something else: $(ss -ltnp "sport = :$PORT" 2>/dev/null | tail -n +2 | awk '{print $NF}')"; fi
+else report here OK "port $PORT free"; fi
+if [[ $WORKER_TRANSFER == nfs ]]; then
+nfs_exports=$(cat /etc/exports /etc/exports.d/*.exports 2>/dev/null | grep -v '^\s*#' | grep -F -- "$(readlink -f "$NFS_PATH")" || true)
+if [[ -n "$nfs_exports" ]]; then report here OK "NFS export: $(head -1 <<<"$nfs_exports" | tr -s ' \t' ' ')"
+else report here WARN "NFS: no /etc/exports line for $(readlink -f "$NFS_PATH") (the worker reads the checkpoint from it)" \
+  "e.g. '$(readlink -f "$NFS_PATH") <worker's link address>(ro,no_subtree_check,no_root_squash)' in /etc/exports, then sudo exportfs -ra (README-nix.md)"; fi
+fi
+
+# ---------------------------------------------------------------- the worker
+if [[ -z "$(worker_host 1)" ]]; then report worker FAIL "WORKER is not set" "WORKER=user@<second Spark> in scripts/local.sh (scripts/local.sh.example)"
+elif ! worker 1 true 2>/dev/null; then report worker FAIL "cannot ssh to $(worker_host 1) without a password" "ssh-copy-id $(worker_host 1)"
+else
+  report worker OK "ssh $(worker_host 1) (key-based)"
+  emit "worker" < <(worker 1 "bash -c $(printf '%q' "$(declare -f node_checks); node_checks '$ENGINE' '$MIN_AVAIL_GIB' $WORKER_ENGRAM_DIR $WORKER_CACHE_DIR $WORKER_DATA_DIR")" 2>/dev/null || true)
+  if [[ $WORKER_TRANSFER == nfs ]]; then
+  wsub=$(worker 1 "findmnt -n -o FSTYPE,OPTIONS,SOURCE -T '$WORKER_HF_MOUNT' 2>/dev/null; [ -d '$WORKER_HF_MOUNT/hub' ] && echo HUB" 2>/dev/null || true)
+  if [[ "$wsub" != *HUB* ]]; then
+    report worker FAIL "does not see this Spark's HF_CACHE at $WORKER_HF_MOUNT" \
+      "on the worker: sudo mkdir -p $WORKER_HF_MOUNT; '<this Spark's link address>:$NFS_PATH $WORKER_HF_MOUNT nfs4 ro,nconnect=8,rsize=1048576,hard,timeo=600,_netdev 0 0' in /etc/fstab; sudo mount $WORKER_HF_MOUNT"
+  elif [[ "$(head -1 <<<"$wsub")" == nfs* ]]; then report worker OK "HF_CACHE over NFS at $WORKER_HF_MOUNT ($(head -1 <<<"$wsub" | awk '{print $1, $3}'))"
+  else report worker WARN "$WORKER_HF_MOUNT is not an NFS mount ($(head -1 <<<"$wsub" | awk '{print $1}')): the worker must read this Spark's files there, not a copy of its own"; fi
+  fi
+  # the link between them (as bin/start finds it)
+  if ( detect_links >/dev/null 2>&1 ); then
+    detect_links >/dev/null 2>&1
+    report link OK "$HEAD_ADDR ($HEAD_DEV, RoCE $HEAD_HCAS, GID $HEAD_GID) <-> $WORKER_ADDR ($WORKER_DEV, RoCE $WORKER_HCAS, GID $WORKER_GID)"
+    if [[ $WORKER_TRANSFER == copy ]]; then
+      if ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$(wsync_host)" true 2>/dev/null; then
+        report link OK "copy: ssh $(wsync_host) (bin/prepare's rsync to the worker goes over the link)"
+      else
+        report link FAIL "copy: cannot ssh to $(wsync_host) without a password (bin/prepare copies the worker's files there)" \
+          "ssh-copy-id $(wsync_host), or WORKER_SYNC_HOST=<user@address> in scripts/local.sh"
+      fi
+    fi
+  else
+    report link FAIL "no CX7/RoCE link to the worker found: $( (detect_links) 2>&1 | tail -1 | sed 's/.*ERROR:[^ ]* //')" "FABRIC_PEER=<the worker's CX7 address> in scripts/local.sh"
+  fi
+  if rank_alive_worker 2>/dev/null; then report worker OK "rank 1 is running"; fi
+fi
+
+# ---------------------------------------------------------------- prepared?
+if [[ "$(cat "$PREPARED_MARKER" 2>/dev/null)" == "$(prepared_state 2>/dev/null)" ]]; then report prepare OK "ready for these settings (bin/prepare's marker)"
+else report prepare WARN "not prepared for these settings yet" "bin/prepare (bin/start runs it by itself)"; fi
+
+echo
+if (( nfail )); then printf '%s%d FAIL%s, %d WARN: fix the FAILs above before bin/start\n' "$Rd" "$nfail" "$R" "$nwarn"; exit 1; fi
+printf '%sNo FAIL%s (%d WARN)\n' "$G" "$R" "$nwarn"

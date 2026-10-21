@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+# Prepare two Sparks to serve Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw with TensorFold's native engine,
+# without docker (scripts/prepare.sh's steps, with nix in place of the image):
+#   1. preflight: nix, the GPU and key-based ssh on both Sparks, the link between them
+#   2. the engine: `nix build` of the flake here (TensorFold's deepseek-v41-zig at flake.lock's pin plus zig/patches, and
+#      the inputs' tools), then the same store path on the worker (nix copy, or a build there from the same flake)
+#   3. the checkpoint into HF_CACHE (~196 GiB, resumable) at flake.lock's revision, each shard checked against the LFS
+#      pointer the flake holds (size; sha256 too with VERIFY_SHA=1), and Engram's two tables, the base model's shards
+#      47 and 48 (~203 GB)
+#   4. the kernel kit: the flake's copy of BertholomusAI's kit/, its RoPE tables and image routing bias made from the
+#      checkpoint, every file checked against its MANIFEST
+#   5. Engram's token map, rank 0's weight file (~106 GB, here) and the folder rank 0 serves (the checkpoint's files
+#      linked, beside model/chat_template.jinja)
+#   6. the worker's own copy (rsync over the link, resumable) of what rank 1 reads: the checkpoint's small files, the kit
+#      and the token map (WORKER_DATA_DIR), Engram's tables (~203 GB, WORKER_ENGRAM_DIR)
+#   7. rank 1's weight file: made here (~106 GB, no GPU), copied to the worker (WORKER_CACHE_DIR), removed here
+#   With WORKER_HF_MOUNT set, the worker reads this Spark's HF_CACHE over NFS there instead (a mount you add, root): every
+#   file a rank reads is checked by size, Engram's tables are copied from the mount and rank 1's weight file is made there.
+# bin/start runs this by itself when needed. Safe to re-run: every step skips work that is already done.
+# Env: VERIFY_SHA=1 (sha256 of every shard: a long read of ~400 GB), ABLIT=1 (as scripts/prepare.sh; HF_TOKEN and gated access)
+set -euo pipefail
+source "$(dirname "$(readlink -f "$0")")/lib.sh"
+
+case "${1:-}" in -h|--help) usage; exit 0 ;; "") ;; *) die "unknown argument: $1" ;; esac
+ablit_notice
+
+# ---------------------------------------------------------------- 1. preflight
+mkdir -p "$STATE_DIR" "$HF_CACHE/hub"
+exec 9>"$STATE_DIR/prepare.lock"
+flock -n 9 || die "another bin/prepare is already running; wait for it or stop it: pgrep -af bin/prepare"
+log "Preflight checks on both Sparks"
+command -v nix >/dev/null || die "nix is not installed here"
+nvidia-smi -L >/dev/null 2>&1 || warn "nvidia-smi failed on this node: is the NVIDIA driver working?"
+check_workers
+need_worker 1
+worker 1 'nvidia-smi -L >/dev/null 2>&1' || warn "nvidia-smi failed on $(worker_host 1)"
+detect_links
+log "Link: this node $HEAD_ADDR ($HEAD_DEV, RoCE $HEAD_HCAS) <-> $(worker_host 1) $WORKER_ADDR ($WORKER_DEV, RoCE $WORKER_HCAS)"
+
+# ---------------------------------------------------------------- 2. the engine
+engine_build
+log "Engine: $ENGINE"
+engine_deploy
+log "Engine $ENGINE on both Sparks"
+INPUTS="$ENGINE/share/tensorfold/tools/inputs"
+
+# The gated overlay before hundreds of GB are downloaded (hf uses HF_TOKEN or its saved login; never passed on)
+if [[ "$ABLIT" == 1 ]]; then
+  log "Downloading the matching Mia 2.9 bpw overlay from $ABLIT_ID @ ${ABLIT_REVISION:0:8}"
+  hf download "$ABLIT_ID" --revision "$ABLIT_REVISION" --cache-dir "$HF_CACHE/hub" \
+    --include apply_mia29_wo_b_graft.py --include "$ABLIT_SIDECAR" --include EXL3_MIA29_ABLIT_META.json --include README.md >/dev/null ||
+    die "cannot download the gated overlay: use your HF read token (HF_TOKEN or hf auth login) and obtain access at https://huggingface.co/$ABLIT_ID"
+fi
+
+# ---------------------------------------------------------------- 3. the checkpoint and Engram's tables
+avail=$(df -B1 --output=avail "$HF_CACHE" | tail -1)
+if [[ ! -f "$(model_cache_dir)/snapshots/$(snapshot_rev)/model.safetensors.index.json" ]]; then
+  (( avail > 215 * 1024 ** 3 )) || die "$MODEL_ID @ $(snapshot_rev | cut -c1-8) is not in $HF_CACHE/hub yet and only $(( avail / 1024 ** 3 )) GiB are free there; it is 196 GiB"
+  (( avail > 420 * 1024 ** 3 )) ||
+    warn "$(( avail / 1024 ** 3 )) GiB free in $HF_CACHE: the checkpoint (196 GiB), Engram's tables (203 GB) and rank 0's weight file (~106 GB) need ~505 GB"
+fi
+log "Downloading $MODEL_ID @ ${MODEL_REVISION:0:8} into $HF_CACHE/hub (196 GiB the first time; resumes; shards another revision already holds are not downloaded again)"
+if ! hf download "$MODEL_ID" ${MODEL_REVISION:+--revision "$MODEL_REVISION"} --cache-dir "$HF_CACHE/hub" >/dev/null; then
+  [[ -n "$MODEL_REVISION" && -f "$(model_cache_dir)/snapshots/$MODEL_REVISION/model.safetensors.index.json" ]] ||
+    die "$MODEL_ID: the download failed"
+  warn "$MODEL_ID: could not reach Hugging Face; using the snapshot already here"
+fi
+SNAP="$(model_cache_dir)/snapshots/$(snapshot_rev)"
+[[ -f "$SNAP/model.safetensors.index.json" ]] || die "$MODEL_ID: no complete snapshot at $SNAP"
+# every file against the flake's copy of the repository: small files byte for byte, each shard by its LFS pointer
+if (( FLAKE_MODEL )); then
+  "${NIX[@]}" build "$_bin_root#model-meta" --out-link "$STATE_DIR/model-meta" || die "nix build .#model-meta failed"
+  META=$(readlink -f "$STATE_DIR/model-meta")
+  bad=0; n=0
+  while IFS= read -r -d '' f; do
+    rel=${f#"$META"/}
+    [[ "$rel" == .* ]] && continue
+    n=$((n + 1))
+    if [[ ! -e "$SNAP/$rel" ]]; then warn "missing in the snapshot: $rel"; bad=1; continue; fi
+    if head -c 40 "$f" | grep -q '^version https://git-lfs'; then
+      want_size=$(sed -n 's/^size //p' "$f"); want_oid=$(sed -n 's/^oid sha256://p' "$f")
+      [[ "$(stat -L -c %s "$SNAP/$rel")" == "$want_size" ]] || { warn "$rel is $(stat -L -c %s "$SNAP/$rel") bytes, not $want_size"; bad=1; continue; }
+      if [[ "${VERIFY_SHA:-0}" == 1 ]]; then
+        [[ "$(sha256sum "$SNAP/$rel" | cut -d' ' -f1)" == "$want_oid" ]] || { warn "$rel does not match its sha256 $want_oid"; bad=1; }
+      fi
+    else
+      cmp -s "$f" "$SNAP/$rel" || { warn "$rel differs from the pinned revision's"; bad=1; }
+    fi
+  done < <(find "$META" -type f -print0)
+  (( bad == 0 )) || die "the snapshot $SNAP does not match flake.lock's revision of $MODEL_ID (above): remove the files named and run bin/prepare again"
+  log "Checkpoint: $n files match flake.lock's $MODEL_ID @ ${MODEL_REVISION:0:8}$( [[ "${VERIFY_SHA:-0}" == 1 ]] && echo ", shards by sha256" || echo ", shards by size (VERIFY_SHA=1: by sha256)")"
+else
+  warn "MODEL_ID / MODEL_REVISION are your own ($MODEL_ID @ ${MODEL_REVISION:0:8}): not checked against flake.lock's"
+fi
+log "Checkpoint: $SNAP ($(du -shL "$SNAP" | cut -f1))"
+
+shards=($ENGRAM_SHARDS)
+inc=(--include model.safetensors.index.json --include config.json); for f in "${shards[@]}"; do inc+=(--include "$f"); done
+log "Downloading Engram's tables: ${ENGRAM_SHARDS// /, } of $ENGRAM_ID${ENGRAM_REVISION:+ @ ${ENGRAM_REVISION:0:8}} (~203 GB the first time; resumes)"
+if ! hf download "$ENGRAM_ID" ${ENGRAM_REVISION:+--revision "$ENGRAM_REVISION"} --cache-dir "$HF_CACHE/hub" "${inc[@]}" >/dev/null; then
+  [[ -n "$ENGRAM_REVISION" ]] || die "$ENGRAM_ID: the download failed"
+  warn "$ENGRAM_ID: could not reach Hugging Face; using the files already here"
+fi
+ESNAP=$(engram_dir)
+declare -A want_sha=([model-00047-of-00048.safetensors]=76a05106ece259be83d1bfea0dcb54f23377864ee60fd321690f35e6698a2af5
+                     [model-00048-of-00048.safetensors]=9dc51433e195bc78b5ad846b68643cc0351d3b174e5e4309222d3b7402c83afd)
+for f in model.safetensors.index.json config.json "${shards[@]}"; do [[ -s "$ESNAP/$f" ]] || die "$ENGRAM_ID: $ESNAP/$f is missing"; done
+if [[ "$ENGRAM_ID" == deepseek-ai/DeepSeek-V4.1-Flash-1017 ]]; then
+  for f in "${shards[@]}"; do
+    [[ -n "${ENGRAM_SHARD_SIZE[$f]:-}" ]] || continue
+    [[ "$(stat -L -c %s "$ESNAP/$f")" == "${ENGRAM_SHARD_SIZE[$f]}" ]] ||
+      die "$f is $(stat -L -c %s "$ESNAP/$f") bytes, not the 1017 release's ${ENGRAM_SHARD_SIZE[$f]}: remove $ESNAP and download again"
+    if [[ "${VERIFY_SHA:-0}" == 1 ]]; then
+      log "sha256 of $f"
+      [[ "$(sha256sum "$ESNAP/$f" | cut -d' ' -f1)" == "${want_sha[$f]}" ]] || die "$f does not match the model card's sha256"
+    fi
+  done
+fi
+log "Engram: $ESNAP ($(du -shL "$ESNAP" | cut -f1))"
+
+# The overlay, before either rank's weight file is made (scripts/prepare.sh's step, with the tools' Python on CPU)
+if [[ "$ABLIT" == 1 ]]; then
+  OVERLAY="$HF_CACHE/hub/models--${ABLIT_ID//\//--}/snapshots/$ABLIT_REVISION"
+  for f in apply_mia29_wo_b_graft.py "$ABLIT_SIDECAR" EXL3_MIA29_ABLIT_META.json; do
+    [[ -s "$OVERLAY/$f" ]] || die "matching Mia overlay file is missing: $f"
+  done
+  stock_dtypes() { python3 "$_bin_root/scripts/ablit_stock_dtypes.py" "$SNAP" "$1"; }
+  mkdir -p "$DATA_DIR"
+  if [[ ! -f "$DATA_DIR/checkpoint/.ablit-ready" ]]; then
+    log "Applying the Mia EAQ 2.9 bpw overlay in $DATA_DIR/checkpoint (stock stays intact; changed shards need extra disk)"
+    rm -rf "$DATA_DIR/checkpoint.new" "$DATA_DIR/stock.new"
+    mkdir -p "$DATA_DIR/stock.new"
+    cp -alL "$SNAP/." "$DATA_DIR/stock.new/"
+    python3 "$OVERLAY/apply_mia29_wo_b_graft.py" --src "$DATA_DIR/stock.new" --dst "$DATA_DIR/checkpoint.new" \
+      --wo-b "$OVERLAY/$ABLIT_SIDECAR" || die "applying the matching Mia overlay failed; rerun bin/prepare to retry"
+    python3 -I -c 'import json,sys; m=json.load(open(sys.argv[1])); assert m["n_edited"] == 104, "expected 104 Mia overlay tensors"' \
+      "$DATA_DIR/checkpoint.new/ABLIT_META.json" || die "Mia overlay did not replace all 104 tensors"
+    stock_dtypes "$DATA_DIR/checkpoint.new" || die "could not give the overlay checkpoint its stock dtypes back"
+    touch "$DATA_DIR/checkpoint.new/.ablit-ready"
+    rm -rf "$DATA_DIR/checkpoint"
+    mv "$DATA_DIR/checkpoint.new" "$DATA_DIR/checkpoint"
+    rm -rf "$DATA_DIR/stock.new"
+  else
+    log "Matching Mia overlay checkpoint: ready"
+    stock_dtypes "$DATA_DIR/checkpoint" || die "could not give the overlay checkpoint its stock dtypes back"
+  fi
+  SNAP="$DATA_DIR/checkpoint"
+fi
+
+# ---------------------------------------------------------------- 4. the kit
+KIT_DIR=$(kit_dir)
+if [[ "$(cat "$KIT_DIR/.kit-rev" 2>/dev/null)" != "$KIT_REF" && "$(git -C "$KIT_DIR" rev-parse HEAD 2>/dev/null)" != "$KIT_REF" ]]; then
+  log "The kernel kit @ ${KIT_REF:0:8} (the flake's) into $KIT_DIR"
+  "${NIX[@]}" build "$_bin_root#kit" --out-link "$STATE_DIR/kit-src" || die "nix build .#kit failed"
+  rm -rf "$KIT_DIR.new" && mkdir -p "$KIT_DIR.new"
+  cp -r "$(readlink -f "$STATE_DIR/kit-src")/." "$KIT_DIR.new/" && chmod -R u+w "$KIT_DIR.new"
+  echo "$KIT_REF" > "$KIT_DIR.new/.kit-rev"
+  rm -rf "$KIT_DIR" && mv "$KIT_DIR.new" "$KIT_DIR"
+fi
+if [[ ! -s "$KIT_DIR/kit/rope-plain-cos.f32" || ! -s "$KIT_DIR/kit/rope-compressed-sin.f32" ]]; then
+  log "Making the kit's RoPE tables from the checkpoint's config (CPU, the tools' PyTorch)"
+  python3 "$INPUTS/make_rope.py" "$SNAP/config.json" "$KIT_DIR/kit" >/dev/null ||
+    die "the RoPE tables do not match the kit's rope.json: the checkpoint's config differs from the one the kit was made for"
+fi
+if [[ ! -s "$KIT_DIR/kit/vision/gate_bias_vl.safetensors" ]]; then
+  log "Making the image routing bias (vision/gate_bias_vl.safetensors) from the checkpoint's gate.bias_vl tensors"
+  python3 "$INPUTS/make_bias_vl.py" "$SNAP" "$KIT_DIR/kit/vision/gate_bias_vl.safetensors" >/dev/null ||
+    die "could not make the image routing bias: does $MODEL_ID hold the gates' bias_vl tensors?"
+fi
+bad=(); n=0
+while read -r sum path; do
+  n=$((n + 1))
+  if [[ ! -f "$KIT_DIR/kit/$path" ]]; then bad+=("missing: $path"); continue; fi
+  [[ "$(sha256sum "$KIT_DIR/kit/$path" | cut -d' ' -f1)" == "$sum" ]] || bad+=("differs: $path")
+done < "$KIT_DIR/kit/MANIFEST"
+for b in "${bad[@]}"; do [[ "$b" == "differs: vision/gate_bias_vl.safetensors" ]] || die "the kit does not check out ($b): $KIT_DIR/kit/MANIFEST"; done
+log "Kit: $((n - ${#bad[@]})) of $n files match MANIFEST$( (( ${#bad[@]} )) && echo "; the image bias is 1017's own")"
+
+# ---------------------------------------------------------------- 5. token map, rank 0's weight file, the served folder
+mkdir -p "$DATA_DIR/rank-cache"
+if [[ ! -s "$DATA_DIR/dsv41_token_map.json" ]]; then
+  log "Engram's token map from the checkpoint's tokenizer"
+  python3 "$INPUTS/make_token_map.py" "$SNAP" "$DATA_DIR/dsv41_token_map.json" >/dev/null
+fi
+tm=$(sha256sum "$DATA_DIR/dsv41_token_map.json" | cut -d' ' -f1)
+if [[ "$tm" == "$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["token_map_sha256"])' "$KIT_DIR/kit/engram.json")" ]]; then
+  log "Token map: the same bytes the kit's Engram fixtures were recorded with"
+else
+  warn "the token map ($tm) differs from the kit's recorded one: the 1017 tokenizer is not the one the kit was recorded with"
+fi
+# the weight file the engine looks for: its name carries the index's hash (tf-dsv41-rank-cache --index-only)
+want=$("$ENGINE/bin/tf-dsv41-rank-cache" "$SNAP" "$STATE_DIR/index-only" 0 2 --index-only | sha256sum | cut -c1-20)
+if [[ -f "$DATA_DIR/rank-cache/rank0of2-$want.bin" ]]; then log "Weight file of rank 0: ready"
+else
+  rm -f "$DATA_DIR/rank-cache/rank0of2-"*.bin "$DATA_DIR/rank-cache/.rank0of2.partial"
+  log "Weight file of rank 0 from the checkpoint (~106 GB, a few minutes)"
+  "$ENGINE/bin/tf-dsv41-rank-cache" "$SNAP" "$DATA_DIR/rank-cache" 0 2 >/dev/null
+fi
+VIEW=$(served_dir)
+rm -rf "$VIEW.new" && mkdir -p "$VIEW.new"
+for f in "$SNAP"/*; do ln -s "$(realpath -s --relative-to="$VIEW.new" "$f")" "$VIEW.new/"; done
+rm -f "$VIEW.new/chat_template.jinja"
+cp model/chat_template.jinja "$VIEW.new/chat_template.jinja"
+rm -rf "$VIEW" && mv "$VIEW.new" "$VIEW"
+[[ -s "$VIEW/config.json" ]] || die "the served folder $VIEW does not reach the checkpoint"
+log "Served folder: $VIEW (the checkpoint linked, the recipe's chat template)"
+
+# ---------------------------------------------------------------- 6-7. the worker's files
+# The default: everything rank 1 reads is copied to the worker's own disk over the link (rsync, resumable)
+worker_files_copy() {
+  local WDATA WENGRAM WCACHE f small=() need have free spare R1 wwant
+  WDATA=$(wabs "$WORKER_DATA_DIR"); WENGRAM=$(wabs "$WORKER_ENGRAM_DIR"); WCACHE=$(wabs "$WORKER_CACHE_DIR")
+  [[ "$WDATA" == /* && "$WENGRAM" == /* && "$WCACHE" == /* ]] ||
+    die "the worker's folders are not absolute paths there: $WDATA, $WENGRAM, $WCACHE (WORKER_DATA_DIR, WORKER_ENGRAM_DIR, WORKER_CACHE_DIR)"
+  worker 1 "mkdir -p '$WDATA/model' '$WENGRAM' '$WCACHE'" || die "could not make the folders on $(worker_host 1)"
+  worker 1 true && ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$(wsync_host)" true ||
+    die "cannot ssh to $(wsync_host) (the worker on the link, for rsync) without a password: ssh-copy-id $(wsync_host), or set WORKER_SYNC_HOST"
+
+  # what rank 1 reads besides the weights: the checkpoint's own files but its shards (it reads config.json), the kit, the token map
+  for f in "$SNAP"/*; do [[ "$f" == *.safetensors ]] || small+=("$f"); done
+  log "Worker: the checkpoint's config and tokenizer files, the kit and the token map into $WDATA (rsync to $(wsync_host))"
+  wsync "$WDATA/model/" "${small[@]}" >/dev/null || die "copying the checkpoint's small files to $(worker_host 1) failed"
+  wsync "$WDATA/kit/" --delete "$KIT_DIR/kit/" >/dev/null || die "copying the kit to $(worker_host 1) failed"
+  wsync "$WDATA/" "$DATA_DIR/dsv41_token_map.json" >/dev/null || die "copying the token map to $(worker_host 1) failed"
+
+  # Engram's tables
+  need=0; for f in "${shards[@]}"; do need=$(( need + $(stat -L -c %s "$ESNAP/$f") )); done
+  have=$(worker 1 "s=0; for f in ${shards[*]}; do [ -f '$WENGRAM'/\$f ] && s=\$(( s + \$(stat -L -c %s '$WENGRAM'/\$f) )); done; echo \$s")
+  if [[ "$have" == "$need" ]]; then log "Worker: Engram tables on its disk"
+  else
+    free=$(worker 1 "df -B1 --output=avail '$WENGRAM' | tail -1")
+    spare=150; worker 1 "ls '$WCACHE'/rank1of2-*.bin >/dev/null 2>&1" && spare=10
+    (( free + have > need + spare * 1024 ** 3 )) || die "$(worker_host 1) has $(( free / 1024 ** 3 )) GiB free: Engram's tables need $(( need / 1024 ** 3 )) GiB on its disk (WORKER_ENGRAM_DIR), its weight file ~106 GB (unless it is already there), and $spare GiB to spare"
+    log "Worker: copying Engram's tables to its disk ($(( need / 1024 ** 3 )) GiB over the link, once; resumes)"
+    wsync "$WENGRAM/" --append-verify "$ESNAP/model.safetensors.index.json" "$ESNAP/config.json" "${shards[@]/#/$ESNAP/}" ||
+      die "copying Engram's tables to $(worker_host 1) failed (run bin/prepare again: it resumes)"
+  fi
+
+  # rank 1's weight file: made here from the checkpoint (no GPU), copied, then removed here. Done only when the worker
+  # has it and the copy here is gone: an interrupted copy leaves both, and the next run resumes it.
+  R1="$DATA_DIR/rank1-cache"
+  wwant=$("$ENGINE/bin/tf-dsv41-rank-cache" "$SNAP" "$STATE_DIR/index-only" 1 2 --index-only | sha256sum | cut -c1-20)
+  if worker 1 "[ -f '$WCACHE/rank1of2-$wwant.bin' ]" && [[ ! -e "$R1/rank1of2-$wwant.bin" ]]; then
+    log "Worker: weight file of rank 1 ready"
+    return 0
+  fi
+  if [[ ! -f "$R1/rank1of2-$wwant.bin" ]]; then
+    rm -rf "$R1"; mkdir -p "$R1"
+    free=$(df -B1 --output=avail "$R1" | tail -1)
+    (( free > 115 * 1024 ** 3 )) || die "$(( free / 1024 ** 3 )) GiB free in $HF_CACHE: rank 1's weight file (~106 GB) is made here before it is copied to the worker"
+    log "Weight file of rank 1 from the checkpoint, here (~106 GB, a few minutes; it moves to the worker next)"
+    "$ENGINE/bin/tf-dsv41-rank-cache" "$SNAP" "$R1" 1 2 >/dev/null || { rm -rf "$R1"; die "writing rank 1's weight file failed"; }
+  fi
+  # another revision's weight file goes (the engine takes the one rank1of2-*.bin there is)
+  worker 1 "for f in '$WCACHE'/rank1of2-*.bin '$WCACHE'/.rank1of2.partial; do [ \"\$f\" = '$WCACHE/rank1of2-$wwant.bin' ] || rm -f \"\$f\"; done"
+  have=$(worker 1 "stat -c %s '$WCACHE/rank1of2-$wwant.bin' 2>/dev/null || echo 0")
+  free=$(worker 1 "df -B1 --output=avail '$WCACHE' | tail -1")
+  need=$(stat -c %s "$R1/rank1of2-$wwant.bin")
+  (( free + have > need + 5 * 1024 ** 3 )) || die "$(worker_host 1) has $(( free / 1024 ** 3 )) GiB free for rank 1's weight file (WORKER_CACHE_DIR): it needs $(( need / 1024 ** 3 )) GiB"
+  log "Worker: copying rank 1's weight file ($(( need / 1024 ** 3 )) GiB over the link; resumes)"
+  wsync "$WCACHE/" --append-verify "$R1/rank1of2-$wwant.bin" ||
+    die "copying rank 1's weight file to $(worker_host 1) failed (run bin/prepare again: it resumes)"
+  [[ "$(worker 1 "stat -c %s '$WCACHE/rank1of2-$wwant.bin'")" == "$need" ]] || die "rank 1's weight file on $(worker_host 1) is not complete"
+  rm -rf "$R1"
+  log "Worker: weight file of rank 1 ready (the copy here is removed)"
+}
+
+# WORKER_HF_MOUNT set: the worker reads this Spark's HF_CACHE over NFS and makes its own weight file from it
+worker_files_nfs() {
+  manifest() {  # the files a rank reads, with their sizes, as paths under HF_CACHE
+    (cd "$1" && find -L "hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev)" \
+       "hub/models--${ENGRAM_ID//\//--}/snapshots/$(engram_rev)" "$DATA_SUB" "$KIT_SUB/kit" \
+       -path '*/.git' -prune -o -path "$DATA_SUB/rank-cache/.*" -prune -o -type f -printf '%p %s\n' | LC_ALL=C sort)
+  }
+  want=$(manifest "$HF_CACHE")
+  worker 1 "[ -d '$WORKER_HF_MOUNT/hub' ]" ||
+    die "$(worker_host 1) does not see this Spark's HF_CACHE at $WORKER_HF_MOUNT: mount it there over NFS, read-only (README-nix.md, NFS; bin/check tells what is missing)"
+  have=$(worker 1 "$(declare -f manifest); MODEL_ID='$MODEL_ID' ENGRAM_ID='$ENGRAM_ID' DATA_SUB='$DATA_SUB' KIT_SUB='$KIT_SUB'; snapshot_rev() { echo '$(snapshot_rev)'; }; engram_rev() { echo '$(engram_rev)'; }; manifest '$WORKER_HF_MOUNT'" 2>/dev/null || true)
+  [[ "$have" == "$want" ]] || { diff <(printf '%s\n' "$want") <(printf '%s\n' "$have") | head -10 >&2
+    die "$(worker_host 1) does not see every file at $WORKER_HF_MOUNT over NFS (above)"; }
+  log "Worker ($(worker_host 1)) reads the checkpoint, the kit and rank 0's files at $WORKER_HF_MOUNT"
+
+  # the worker's own disk: Engram's tables (copied from the mount), rank 1's weight file (written there from the mount)
+  WESNAP=$(wpath "$ESNAP")
+  need=0; for f in "${shards[@]}"; do need=$(( need + $(stat -L -c %s "$ESNAP/$f") )); done
+  have=$(worker 1 "d=$WORKER_ENGRAM_DIR; s=0; for f in ${shards[*]}; do [ -f \$d/\$f ] && s=\$(( s + \$(stat -L -c %s \$d/\$f) )); done; echo \$s")
+  if [[ "$have" == "$need" ]]; then log "Worker: Engram tables on its disk"
+  else
+    free=$(worker 1 "mkdir -p $WORKER_ENGRAM_DIR && df -B1 --output=avail $WORKER_ENGRAM_DIR | tail -1")
+    spare=150; worker 1 "ls $WORKER_CACHE_DIR/rank1of2-*.bin >/dev/null 2>&1" && spare=10
+    (( free + have > need + spare * 1024 ** 3 )) || die "$(worker_host 1) has $(( free / 1024 ** 3 )) GiB free: Engram's tables need $(( need / 1024 ** 3 )) GiB on its disk (WORKER_ENGRAM_DIR), its weight file ~106 GB (unless it is already there), and $spare GiB to spare"
+    log "Worker: copying Engram's tables to its disk ($(( need / 1024 ** 3 )) GiB over NFS, once)"
+    worker 1 "for f in model.safetensors.index.json config.json ${shards[*]}; do cp '$WESNAP'/\$f $WORKER_ENGRAM_DIR/\$f.part && mv $WORKER_ENGRAM_DIR/\$f.part $WORKER_ENGRAM_DIR/\$f || exit 1; done" ||
+      die "copying Engram's tables to $(worker_host 1) failed"
+  fi
+  WSNAP=$(wpath "$SNAP")
+  wwant=$(worker 1 "'$ENGINE/bin/tf-dsv41-rank-cache' '$WSNAP' $WSTATE/index-only 1 2 --index-only | sha256sum | cut -c1-20")
+  if worker 1 "[ -f $WORKER_CACHE_DIR/rank1of2-$wwant.bin ]"; then log "Worker: weight file of rank 1 ready"
+  else
+    worker 1 "mkdir -p $WORKER_CACHE_DIR && rm -f $WORKER_CACHE_DIR/rank1of2-*.bin $WORKER_CACHE_DIR/.rank1of2.partial"
+    free=$(worker 1 "df -B1 --output=avail $WORKER_CACHE_DIR | tail -1")
+    (( free > 130 * 1024 ** 3 )) || die "$(worker_host 1) has $(( free / 1024 ** 3 )) GiB free for rank 1's weight file (WORKER_CACHE_DIR): it needs ~106 GB"
+    log "Worker: weight file of rank 1 from the checkpoint over NFS (~106 GB, a few minutes)"
+    worker 1 "'$ENGINE/bin/tf-dsv41-rank-cache' '$WSNAP' $WORKER_CACHE_DIR 1 2" >/dev/null ||
+      die "writing rank 1's weight file on $(worker_host 1) failed"
+  fi
+}
+
+ESNAP=$(engram_dir); KIT_DIR=$(kit_dir)
+if [[ $WORKER_TRANSFER == copy ]]; then worker_files_copy; else worker_files_nfs; fi
+
+prepared_state > "$PREPARED_MARKER"
+log "Done: both Sparks are ready. Start the server with bin/start (port $PORT)."

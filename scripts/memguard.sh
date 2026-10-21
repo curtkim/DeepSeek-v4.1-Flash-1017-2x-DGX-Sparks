@@ -6,6 +6,8 @@
 #   - MemAvailable under the (soft) floor for HOLD seconds without once coming back over it (default 4 s): a long prompt's workspace
 #     takes a few GiB for a moment and gives them back, which is not a rank in trouble. A dip that recovers is logged, not killed.
 # Self-contained: start.sh copies it to the worker.
+# <container> is a docker container's name, or pidfile:<file> for a rank that bin/start runs without docker: the process
+# group whose leader's pid that file holds is killed (SIGKILL) instead.
 #
 # Usage: memguard.sh start <container> <floor GiB> <log file> <pid file> [hold seconds [hard floor GiB]]
 #                                                       (replaces a guard already running for the pid file)
@@ -26,6 +28,17 @@ stop_guard() {
     for _ in $(seq 1 50); do [[ -d /proc/$pid ]] || break; sleep 0.1; done   # its exit handler runs first
   fi
   rm -f "$pidfile"
+}
+# kill_target <container | pidfile:file>: docker kill, or SIGKILL to the process group of a rank run without docker
+kill_target() {
+  local pid
+  if [[ $1 == pidfile:* ]]; then
+    pid=$(cat "${1#pidfile:}" 2>/dev/null)
+    [[ "$pid" =~ ^[0-9]+$ && -d /proc/$pid ]] || return 1
+    kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid"
+  else
+    docker kill "$1" >/dev/null 2>&1
+  fi
 }
 # a sleep a signal ends at once (a plain sleep holds the guard's exit handler back until it is over)
 nap() { sleep "$1" & wait $!; }
@@ -56,12 +69,12 @@ run_guard() {
     if (( hard_low < 2 && now - since < hold_us )); then continue; fi
     since=0; hard_low=0
     # Kill first, log afterwards: on a machine that is already thrashing every command ahead of the kill costs time. The
-    # process snapshot runs beside it (it shows who else holds the memory); docker kill fails when the container is not running.
+    # process snapshot runs beside it (it shows who else holds the memory); the kill fails when the rank is not running.
     ps -eo rss,pid,comm --sort=-rss 2>/dev/null | head -6 > "$snap" &
-    if timeout 20 docker kill "$c" >/dev/null 2>&1; then
+    if timeout 20 bash -c "$(declare -f kill_target); kill_target \"\$1\"" _ "$c"; then
       wait
       {
-        echo "$(stamp) memguard: MemAvailable $(( a / 1024 )) MiB (lowest $(( low_min / 1024 )) MiB) was under the $floor_gib GiB floor for $hold s or under the $hard_gib GiB hard floor: killed container $c"
+        echo "$(stamp) memguard: MemAvailable $(( a / 1024 )) MiB (lowest $(( low_min / 1024 )) MiB) was under the $floor_gib GiB floor for $hold s or under the $hard_gib GiB hard floor: killed $c"
         sed 's/^/    /' "$snap"
       } >> "$log"
       nap 5

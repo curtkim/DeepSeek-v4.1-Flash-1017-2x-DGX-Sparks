@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# Serve Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw on two DGX Sparks with TensorFold's native engine, without
+# docker: runs bin/prepare when the engine, the checkpoint, the weight files or the kit are not ready yet, starts rank 1 on
+# the worker and rank 0 here (the API on port 8888) as processes of their own session, waits until the OpenAI API
+# answers, then runs a smoke test. The worker serves from its own copy of what rank 1 reads (bin/prepare; or this
+# Spark's HF_CACHE over NFS with WORKER_HF_MOUNT). Stop it with bin/stop.
+# (./start.sh's steps and settings; the engine is the flake's, `nix build`.)
+#
+# Usage: bin/start [restart] [extra tensorfold-native serve args]
+#   bin/start                  # scripts/config.sh's defaults; if the server already runs, says so and leaves it alone
+#   bin/start restart          # bin/stop, then start again (e.g. after changing settings)
+#   CONTEXT=262144 bin/start restart
+#   API_KEY=1 bin/start restart   # require an API key (generated in $STATE_DIR/api-key, mode 600)
+#   FOREGROUND=1 bin/start        # stay attached to rank 0's log and exit with its code (for systemd Restart=on-failure)
+#   DRY_RUN=1 bin/start           # print the link found and both ranks' commands, change nothing and start nothing
+# Extra arguments go to rank 0's `tensorfold-native serve` after the defaults, so they win.
+# Settings: as ./start.sh (scripts/config.sh), plus WORKER_DATA_DIR, WORKER_SYNC_HOST, WORKER_HF_MOUNT (NFS instead of the
+# copy), WORKER_NIX_BIN, TF_DRIVER_LIB_DIR (the folder of the host's libcuda.so.1, when it is not found): bin/lib.sh.
+# Logs: rank 0 in $LOG_DIR/rank0-current.log, rank 1 in ~/.cache/dsv41-tensorfold/logs/rank1-current.log on the worker.
+set -euo pipefail
+source "$(dirname "$(readlink -f "$0")")/lib.sh"
+
+WAIT_TIMEOUT="${WAIT_TIMEOUT:-2400}"
+MODE=start
+case "${1:-}" in
+  restart) MODE=restart; shift ;;
+  help|-h|--help) usage; exit 0 ;;
+esac
+ablit_notice
+DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
+for v in CONTEXT PARALLEL MAX_TOKENS TOP_K; do [[ "${!v}" =~ ^[1-9][0-9]*$ ]] || die "$v is a positive count, not ${!v}"; done
+(( CONTEXT <= 1048576 )) || die "CONTEXT is at most 1048576 (the model's window), not $CONTEXT"
+(( PARALLEL <= 16 )) || die "PARALLEL is 1 to 16 (the engine's streams), not $PARALLEL"
+[[ -z "$ROUND_ROWS" ]] || { [[ "$ROUND_ROWS" =~ ^[0-9]+$ ]] && (( ROUND_ROWS >= 16 && ROUND_ROWS <= 48 )); } || die "ROUND_ROWS is empty or 16 to 48, not $ROUND_ROWS"
+[[ -z "$THINKING_BUDGET" || "$THINKING_BUDGET" =~ ^[1-9][0-9]*$ ]] || die "THINKING_BUDGET is a positive count of reasoning tokens (or empty for no cap), not $THINKING_BUDGET"
+[[ -z "$REASONING_EFFORT" || "$REASONING_EFFORT" =~ ^(low|medium|high|xhigh)$ ]] || die "REASONING_EFFORT is low, medium, high or xhigh (or empty), not $REASONING_EFFORT"
+[[ "$MIN_AVAIL_GIB" =~ ^[0-9]+$ ]] || die "MIN_AVAIL_GIB is a whole number of GiB (0 turns it off), not $MIN_AVAIL_GIB"
+[[ "$MIN_AVAIL_WAIT_S" =~ ^[0-9]+$ ]] || die "MIN_AVAIL_WAIT_S is a whole number of seconds (0 reads the memory once), not $MIN_AVAIL_WAIT_S"
+[[ "$MEMGUARD_GIB" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "MEMGUARD_GIB is a number of GiB (2.5 is fine; 0 turns it off), not $MEMGUARD_GIB"
+[[ "$MEMGUARD_HOLD_S" =~ ^[0-9]+(\.[0-9]+)?$ && "$MEMGUARD_HARD_GIB" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "MEMGUARD_HOLD_S is a number of seconds and MEMGUARD_HARD_GIB a number of GiB, not $MEMGUARD_HOLD_S and $MEMGUARD_HARD_GIB"
+[[ "$PREFILL_INTERLEAVE_MS" =~ ^[0-9]+$ ]] && (( PREFILL_INTERLEAVE_MS <= 5000 )) || die "PREFILL_INTERLEAVE_MS is 0 to 5000 milliseconds, not $PREFILL_INTERLEAVE_MS"
+for v in THINKING DRAFTS RDMA GRAPHS SIDE PREFETCH ENGRAM_AIO REPLAY_FLOOR API_KEY; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
+[[ "${RANK1_PROFILE:-}" =~ ^[012]?$ ]] || die "RANK1_PROFILE is empty, 0, 1 or 2, not '${RANK1_PROFILE:-}'"
+nccl_extra_collect
+check_workers
+
+# rank 0's arguments (no link needed): built first, so the flags can be checked before anything is stopped
+SERVE=(serve "$(served_dir)" --backend cuda --host "$HOST" --port "$PORT" --name "$SERVED_NAME"
+       --context "$CONTEXT" --parallel "$PARALLEL" --max-tokens "$MAX_TOKENS" --temperature "$TEMPERATURE" --top-p "$TOP_P" --top-k "$TOP_K")
+if [[ "$THINKING" == 1 ]]; then SERVE+=(--thinking); else SERVE+=(--no-thinking); fi
+[[ -z "$REASONING_EFFORT" ]] || SERVE+=(--reasoning-effort "$REASONING_EFFORT")
+[[ -z "$THINKING_BUDGET" ]] || SERVE+=(--thinking-budget "$THINKING_BUDGET")
+[[ "$DRAFTS" == 1 ]] || SERVE+=(--no-drafts)
+[[ "$API_KEY" != 1 ]] || SERVE+=(--api-key-file "$API_KEY_FILE")
+SERVE+=("$@")
+
+B=$'\033[1m'; M=$'\033[1;35m'; G=$'\033[1;32m'; D=$'\033[2m'; R=$'\033[0m'
+[[ -t 1 ]] || { B=; M=; G=; D=; R=; }
+source ./scripts/banner.sh
+echo
+banner
+printf '\n%s  Mia'"'"'s TensorFold Start Script (nix)%s\n' "$M" "$R"
+printf '%s  %s · 2 x DGX Spark · %s at once · %s-token window · EXL3 2.9 bpw · port %s%s\n\n' "$D" "$MODEL_ID" "$PARALLEL" "$CONTEXT" "$PORT" "$R"
+STEPS=5
+step() { printf '%s[%s/%s]%s %s%s%s\n' "$M" "$1" "$STEPS" "$R" "$B" "$2" "$R"; }
+
+command -v nix >/dev/null || die "nix is not installed here"
+mkdir -p "$STATE_DIR" "$LOG_DIR"
+exec 8>"$STATE_DIR/start.lock"
+flock -n 8 || die "another bin/start is already running; wait for it to finish"
+need_workers
+(( DRY )) && log "DRY_RUN=1: printing the commands; nothing is stopped, started or prepared"
+
+API_HOST="$HOST"; [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] && API_HOST=127.0.0.1
+URL="http://$API_HOST:$PORT"
+run_ident() { echo "ablit=$(ablit_identity) prepared=$(prepared_state 2>/dev/null)"; }
+if (( ! DRY )) && [[ "$MODE" == start ]] && rank_alive_here && rank_alive_worker; then
+  [[ "$(cat "$RUN_STATE" 2>/dev/null)" == "$(run_ident)" ]] ||
+    die "the running ranks were started with another configuration (ABLIT, the engine or the checkpoint); run bin/start restart"
+  log "The server is already running on both Sparks (port $PORT): nothing to do. bin/start restart restarts it, bin/stop stops it."
+  exit 0
+fi
+
+# ---------------------------------------------------------------- 1. setup
+step 1 "Setup: engine, checkpoint, Engram's tables, weight files and kit; the worker's copy"
+if [[ "${PREPARE:-auto}" == 1 || ( "${PREPARE:-auto}" != 0 && "$(prepared_state 2>/dev/null)" != "$(cat "$PREPARED_MARKER" 2>/dev/null)" ) ]]; then
+  if (( DRY )); then log "DRY_RUN: bin/prepare would run now (not ready yet)"
+  else
+    if rank_alive_here || rank_alive_worker; then
+      log "Setup is needed and a server is running: stopping it first (the build needs the memory)"
+      "$_bin_root/bin/stop"
+    fi
+    log "Not ready yet: running bin/prepare (the first time this builds the engine, downloads ~400 GB and writes two ~106 GB weight files)"
+    "$_bin_root/bin/prepare"
+  fi
+fi
+if engine_paths; then
+  log "Ready: $ENGINE, $MODEL_ID @ $(snapshot_rev | cut -c1-8), Engram's tables, the weight files and the kit"
+elif (( DRY )); then
+  ENGINE='<engine: nix build .#tensorfold>'
+else
+  die "no engine at $ENGINE_LINK: bin/prepare did not build it"
+fi
+(( DRY )) || worker 1 "[ -x '$ENGINE/bin/tf-dsv41-lanes' ]" || die "$(worker_host 1) has no $ENGINE: run bin/prepare"
+
+# ---------------------------------------------------------------- 2. checks
+step 2 "Checks: link, previous server, port, memory"
+if [[ -n "$HEAD_ENGRAM_DIR" ]] && (( ! DRY )); then
+  for f in $ENGRAM_SHARDS; do
+    [[ -f "$HEAD_ENGRAM_DIR/$f" ]] || die "HEAD_ENGRAM_DIR $HEAD_ENGRAM_DIR has no $f (needs: $ENGRAM_SHARDS)"
+    if [[ "$ENGRAM_ID" == deepseek-ai/DeepSeek-V4.1-Flash-1017 && -n "${ENGRAM_SHARD_SIZE[$f]:-}" ]]; then
+      [[ "$(stat -L -c %s "$HEAD_ENGRAM_DIR/$f")" == "${ENGRAM_SHARD_SIZE[$f]}" ]] ||
+        die "$HEAD_ENGRAM_DIR/$f is $(stat -L -c %s "$HEAD_ENGRAM_DIR/$f") bytes, not the release's ${ENGRAM_SHARD_SIZE[$f]}: copy it again (or unset HEAD_ENGRAM_DIR)"
+    fi
+  done
+fi
+detect_links
+log "Link: rendezvous $MASTER_ADDR:$MASTER_PORT"
+for r in 0 1; do
+  log "  rank $r ($( (( r == 0 )) && echo this node || worker_host "$r")): RoCE ${NODE_HCAS[r]} (GID ${NODE_GID[r]})"
+done
+# the serve flags against what this build of tensorfold-native serves: it refuses an unsupported flag only at start
+if (( ! DRY )); then
+  "$ENGINE/bin/tensorfold-native" capabilities --json | python3 scripts/zig_flags.py "${SERVE[@]:2}" ||
+    die "rank 0's serve arguments are not ones $ENGINE serves (above); nothing was stopped"
+  if rank_alive_here || rank_alive_worker; then "$_bin_root/bin/stop"; fi
+  rm -f "$RANK0_PID"; worker 1 "rm -f $RANK1_PID"
+  if ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; then die "port $PORT is already in use: $(ss -ltnp "sport = :$PORT" 2>/dev/null | tail -n +2)"; fi
+  if (( MIN_AVAIL_GIB > 0 )); then
+    await_memory || true
+    if awk -v a="$HERE_GB" -v m="$MIN_AVAIL_GIB" 'BEGIN {exit !(a < m)}'; then
+      shm=$(du -sm /dev/shm 2>/dev/null | cut -f1); shm=${shm:-0}
+      die "only $HERE_GB GiB memory available here, $MIN_AVAIL_GIB GiB needed (the weights plus the engine's reserve): free memory first${shm:+ (/dev/shm holds $shm MiB)}; MIN_AVAIL_GIB=0 skips this check, and a rank that takes all the memory freezes the Spark"
+    fi
+    awk -v a="$WORKER_GB" -v m="$MIN_AVAIL_GIB" 'BEGIN {exit !(a < m)}' &&
+      die "only $WORKER_GB GiB memory available on $(worker_host 1), $MIN_AVAIL_GIB GiB needed: stop other GPU work there (MIN_AVAIL_GIB=0 skips this check)"
+  fi
+  memguard_start
+fi
+
+# ---------------------------------------------------------------- 3. launch
+# What both ranks' engine reads (BertholomusAI's two-node launch), and every TENSORFOLD_* / TF_DS_* you set
+ENGINE_ENV=("TF_DS_REPLAY_FLOOR=$REPLAY_FLOOR" "TF_DS_STREAMS=$PARALLEL" "HF_HUB_OFFLINE=$HF_HUB_OFFLINE")
+[[ -z "$ROUND_ROWS" ]] || ENGINE_ENV+=("TF_DS_ROUND_ROWS=$ROUND_ROWS")
+(( PREFILL_INTERLEAVE_MS == 0 )) || ENGINE_ENV+=("TF_DS_PREFILL_INTERLEAVE_MS=$PREFILL_INTERLEAVE_MS")
+while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|ROUND_ROWS|GRAPHS|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP)=' || true)
+KIT_DIR=$(kit_dir)
+# rank 1 takes the round's settings as flags only; its pool is rank 0's context and its streams rank 0's
+FOLLOW="--pool $CONTEXT --streams $PARALLEL --drafts $DRAFTS --graphs $GRAPHS --side $SIDE --prefetch $PREFETCH --aio $ENGRAM_AIO"
+[[ -z "$ROUND_ROWS" ]] || FOLLOW+=" --round-rows $ROUND_ROWS"
+[[ "${RANK1_PROFILE:-0}" == 0 ]] || FOLLOW+=" --profile $RANK1_PROFILE"
+AUTH=()
+if [[ "$API_KEY" == 1 ]]; then
+  if (( DRY )); then log "DRY_RUN: API_KEY=1: the key would be read from $API_KEY_FILE (created, mode 600, when missing)"
+  else api_key_ensure; AUTH=(-H "@$(api_header_file)"); fi
+fi
+step 3 "Launch: rank 1 on the worker, then rank 0 here"
+# rank 1: the worker's paths (its copy of the checkpoint's config, the kit and the token map, or the same through its NFS
+# mount; Engram's tables and its weight file on its disk)
+args1="$ENGINE/bin/tf-dsv41-lanes $(w_model_dir) $WORKER_CACHE_DIR 1 2 ${LINK_HEAD_ADDR[1]:-$MASTER_ADDR} $MASTER_PORT $(w_kit_dir) --engram $WORKER_ENGRAM_DIR --token-map $(w_token_map) $FOLLOW"
+[[ "$RDMA" == 0 ]] || args1+=" --rdma ${NODE_HCAS[1]}"
+env1=""; for x in "${ENGINE_ENV[@]}" "TF_RDMA_GID_INDEX=${NODE_GID[1]}" $(nccl_assign 1); do env1+="$(printf '%q' "$x") "; done
+inner1="$RANK_LIMITS; exec env $env1$args1"
+remote="mkdir -p $WSTATE/logs; rm -f $RANK1_PID; $(declare -f log_rotate); log_rotate $WSTATE/logs 1 $RANK1_LOG $LOG_KEEP >/dev/null; setsid bash -c $(printf '%q' "$inner1") > $RANK1_LOG 2>&1 < /dev/null & echo \$! > $RANK1_PID"
+if (( DRY )); then printf '[dry-run] rank 1 on %s:\n  %s\n' "$(worker_host 1)" "$inner1"
+else
+  log "Rank 1 on $(worker_host 1): $args1"
+  worker 1 "bash -c $(printf '%q' "$remote")" >/dev/null || die "could not start rank 1 on $(worker_host 1)"
+fi
+# rank 0: this Spark's paths
+ENV0=(TF_TP_WORLD=2 "TF_TP_MASTER=${LINK_HEAD_ADDR[1]:-$MASTER_ADDR}" "TF_TP_PORT=$MASTER_PORT" "TF_DS_RANK_CACHE=$DATA_DIR/rank-cache" "TF_DS_KIT=$KIT_DIR/kit"
+      "TENSORFOLD_CUDA_KERNELS=$KIT_DIR/kit/aot" "TF_DS_ENGRAM=${HEAD_ENGRAM_DIR:-$(engram_dir)}" "TF_DS_TOKEN_MAP=$DATA_DIR/dsv41_token_map.json"
+      "TF_DS_GRAPHS=$GRAPHS" "TF_DS_HC_SIDE=$SIDE" "TF_DS_L2_PREFETCH=$PREFETCH" "TF_DS_ENGRAM_AIO=$ENGRAM_AIO" "TF_RDMA_GID_INDEX=${NODE_GID[0]}")
+[[ "$RDMA" == 0 ]] || ENV0+=("TF_RDMA_DEVICES=${NODE_HCAS[0]}")
+mapfile -t NCCL0 < <(nccl_assign 0)
+here=(env "${ENV0[@]}" "${ENGINE_ENV[@]}" "${NCCL0[@]}" "$ENGINE/bin/tensorfold-native" "${SERVE[@]}")
+if (( DRY )); then printf '[dry-run] rank 0 here:\n  %s\n' "$(printf '%q ' "${here[@]}")"; exit 0; fi
+log "Rank 0 here: tensorfold-native ${SERVE[*]}"
+rm -f "$RANK0_PID"
+log_rotate "$LOG_DIR" 0 "$RANK0_LOG" "$LOG_KEEP" >/dev/null || true
+# its own session (bin/stop and memguard signal the whole group); not holding start.sh's lock
+setsid bash -c "$RANK_LIMITS; exec \"\$@\"" rank0 "${here[@]}" > "$RANK0_LOG" 2>&1 < /dev/null 8>&- &
+RANK0=$!
+echo "$RANK0" > "$RANK0_PID"
+run_ident > "$RUN_STATE"
+
+# FOREGROUND=1: stay with rank 0 and exit with its code, so a supervisor (systemd's Restart=on-failure) can restart the
+# server; either rank ending takes the other down (a lone rank waits for its peer forever). SIGINT and SIGTERM run bin/stop.
+if [[ "${FOREGROUND:-0}" == 1 ]]; then
+  trap '"$_bin_root/bin/stop"; exit 130' INT TERM
+  tail -n +1 -F "$RANK0_LOG" --pid="$RANK0" &
+  ( exec 8>&-
+    while sleep 30; do
+      [[ -d /proc/$RANK0 ]] || exit 0
+      worker 1 true 2>/dev/null || continue
+      rank_alive_worker && continue
+      warn "rank 1 on $(worker_host 1) exited: stopping rank 0"
+      stop_group "$RANK0" "${STOP_TIMEOUT:-30}"
+      exit 1
+    done ) &
+  watch=$!
+  code=0; wait "$RANK0" || code=$?
+  kill "$watch" 2>/dev/null || true
+  w=0; wait "$watch" || w=$?
+  [[ "$w" != 1 || "$code" != 0 ]] || code=1
+  "$_bin_root/bin/stop" || true
+  exit "$code"
+fi
+
+# ---------------------------------------------------------------- 4. load
+step 4 "Loading: ~98 GiB of weights on each Spark, then Engram and the caches (a few minutes)"
+tail -n +1 -F "$RANK0_LOG" 2>/dev/null | sed -u "s/^/  ${D}│${R} /" &
+LOGS_PID=$!
+trap 'kill $LOGS_PID 2>/dev/null || true' EXIT
+fail() {
+  kill $LOGS_PID 2>/dev/null || true
+  printf '%s── rank 1 (%s): last log lines ──%s\n' "$D" "$(worker_host 1)" "$R"; worker 1 "tail -n 15 $RANK1_LOG" 2>&1 | sed 's/^/  │ /'
+  die "$1"
+}
+start=$SECONDS
+until curl -sf --max-time 5 "${AUTH[@]}" "$URL/v1/models" >/dev/null 2>&1; do
+  if ! rank_alive_here; then
+    code=0; wait "$RANK0" 2>/dev/null || code=$?
+    fail "rank 0 exited (code $code) before it was ready (log: $RANK0_LOG)"
+  fi
+  rank_alive_worker || fail "rank 1 on $(worker_host 1) exited before the server was ready"
+  (( SECONDS - start < WAIT_TIMEOUT )) || fail "not ready after ${WAIT_TIMEOUT}s (WAIT_TIMEOUT); the ranks are still running"
+  sleep 5
+done
+kill $LOGS_PID 2>/dev/null || true
+log "Server answered after $((SECONDS - start))s"
+
+# ---------------------------------------------------------------- 5. smoke test
+step 5 "Smoke test: one chat completion through both ranks"
+if smoke=$(curl -s --max-time 300 "${AUTH[@]}" "$URL/v1/chat/completions" -H 'Content-Type: application/json' \
+             -d "{\"model\": \"$SERVED_NAME\", \"max_tokens\": 16, \"temperature\": 0, \"chat_template_kwargs\": {\"enable_thinking\": false}, \"messages\": [{\"role\": \"user\", \"content\": \"Reply with OK.\"}]}" |
+           python3 -c 'import json,sys; r = json.load(sys.stdin); c = r["choices"][0]["message"].get("content") or ""; assert c.strip(); assert len(c.strip()) < 8 or len(set(c.strip())) > 2, "one repeated character"; print(repr(c.strip()[:40]) + ",", r["usage"]["completion_tokens"], "tokens")' 2>/dev/null); then
+  log "OK: $smoke"
+else
+  fail "the smoke test request failed (no reply text, or one character repeated); the ranks are still running"
+fi
+if awk -v g="$MEMGUARD_GIB" 'BEGIN {exit !(g > 0)}'; then
+  mem_here=$(mem_available_gib)
+  mem_there=$(worker 1 "awk '/^MemAvailable:/ {printf \"%.1f\", \$2 / 1048576}' /proc/meminfo" 2>/dev/null || echo "?")
+  log "Memory after the load: ${mem_here} GiB available on this Spark, ${mem_there} GiB on $(worker_host 1); memguard's floor is $MEMGUARD_GIB GiB"
+  for pair in "this Spark:$mem_here" "$(worker_host 1):$mem_there"; do
+    v=${pair##*:}; [[ "$v" =~ ^[0-9.]+$ ]] || continue
+    awk -v a="$v" -v g="$MEMGUARD_GIB" 'BEGIN {exit !(a < g + 3)}' &&
+      warn "only $v GiB available on ${pair%:*}, within 3 GiB of memguard's floor ($MEMGUARD_GIB GiB): a long prompt can take that and memguard then kills the rank. Free memory there before relying on this server"
+  done
+fi
+IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+[[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] || IP="$HOST"
+printf '\n%s  ✔ %s is now LIVE! on port %s%s\n\n' "$G" "$SERVED_NAME" "$PORT" "$R"
+cat <<EOF
+    API      http://${IP:-<spark-address>}:$PORT/v1   (model: $SERVED_NAME)
+    Access   $( [[ "$API_KEY" == 1 ]] && echo "API key required: Authorization: Bearer \$(cat $API_KEY_FILE)" || echo "open: no key, anyone who reaches port $PORT can use it (API_KEY=1 requires one)")
+    Window   $CONTEXT tokens · $PARALLEL at once · EXL3 2.9 bpw · drafts $( [[ "$DRAFTS" == 1 ]] && echo on || echo off) · images on
+    Engine   $ENGINE
+    Logs     tail -f $RANK0_LOG   (rank 1: ssh $(worker_host 1) tail -f ~/.cache/dsv41-tensorfold/logs/rank1-current.log)
+    Restart  bin/start restart
+    Stop     bin/stop
+
+EOF

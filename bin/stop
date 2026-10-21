@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Stop the server that bin/start started, freeing the GPU memory of both Sparks: rank 0 here and rank 1 on the worker.
+# Each rank's process group gets SIGTERM, then SIGKILL after STOP_TIMEOUT seconds (default 30); requests still running are
+# cut off (not drained), so it says when there are any. Each rank's log is gzipped into LOG_DIR here
+# (~/.cache/dsv41-tensorfold/logs) and ~/.cache/dsv41-tensorfold/logs on the worker; the newest LOG_KEEP (10) of each rank stay.
+# (./stop.sh, for the ranks bin/start runs without docker.)
+# Usage: bin/stop            DRY_RUN=1 bin/stop says what it would stop, and stops nothing
+set -euo pipefail
+source "$(dirname "$(readlink -f "$0")")/lib.sh"
+case "${1:-}" in -h|--help) usage; exit 0 ;; "") ;; *) die "unknown argument: $1" ;; esac
+
+T="${STOP_TIMEOUT:-30}"
+pid0=$(rank_pid_here || true)
+reach=1; [[ -n "$(worker_host 1)" ]] || { warn "WORKER is not set (scripts/local.sh): rank 1 was left alone"; reach=0; }
+if (( reach )) && ! worker 1 true 2>/dev/null; then warn "cannot reach the worker ($(worker_host 1)) over ssh: rank 1 was left alone"; reach=0; fi
+pid1=""
+(( reach )) && pid1=$(worker 1 "p=\$(cat $RANK1_PID 2>/dev/null) && [ -n \"\$p\" ] && grep -qa tensorfold /proc/\$p/cmdline 2>/dev/null && echo \$p" 2>/dev/null || true)
+
+if [[ -z "$pid0" && -z "$pid1" ]]; then
+  if [[ "${DRY_RUN:-0}" != 1 ]]; then
+    memguard_stop
+    rm -f "$RANK0_PID" "$RUN_STATE"
+    (( reach )) && worker 1 "rm -f $RANK1_PID" || true
+  fi
+  log "No rank is running on either Spark: nothing to stop"
+  exit 0
+fi
+where="on both Sparks"; [[ -n "$pid1" ]] || where="here"; [[ -n "$pid0" ]] || where="on the worker"
+
+if [[ -n "$pid0" ]]; then
+  api_host="$HOST"; [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] && api_host=127.0.0.1
+  [[ "$api_host" == *:* ]] && api_host="[$api_host]"
+  busy=$(curl -s --max-time 3 "http://$api_host:$PORT/health" 2>/dev/null |
+         python3 -c 'import json,sys; d = json.load(sys.stdin); print((d.get("live") or {}).get("connections", d.get("requests_running", 0)))' 2>/dev/null || echo 0)
+  [[ "$busy" =~ ^[0-9]+$ ]] || busy=0
+  (( busy == 0 )) || warn "$busy request(s) still running will be cut off"
+fi
+if [[ "${DRY_RUN:-0}" == 1 ]]; then
+  log "DRY_RUN=1: would stop the ranks $where (SIGTERM, SIGKILL after ${T}s); nothing is stopped"
+  [[ -z "$pid0" ]] || printf '[dry-run] rank 0 here: process group %s; its log %s saved to %s\n' "$pid0" "$RANK0_LOG" "$LOG_DIR"
+  [[ -z "$pid1" ]] || printf '[dry-run] rank 1 on %s: process group %s; its log saved to ~/.cache/dsv41-tensorfold/logs there\n' "$(worker_host 1)" "$pid1"
+  exit 0
+fi
+log "Stopping the ranks $where (up to ${T}s)"
+
+failed=0
+if [[ -n "$pid1" ]]; then
+  ( saved=$(worker 1 "$(declare -f stop_group log_rotate); stop_group $pid1 $T; rm -f $RANK1_PID; log_rotate $WSTATE/logs 1 $RANK1_LOG $LOG_KEEP") ||
+      { warn "could not stop rank 1 on $(worker_host 1)"; exit 1; }
+    log "Stopped rank 1 on $(worker_host 1)${saved:+; its log there: $saved}" ) &
+  wpid=$!
+fi
+if [[ -n "$pid0" ]]; then
+  stop_group "$pid0" "$T"
+  rm -f "$RANK0_PID"
+  saved=$(log_rotate "$LOG_DIR" 0 "$RANK0_LOG" "$LOG_KEEP") || warn "could not save rank 0's log to $LOG_DIR"
+  log "Stopped rank 0 here${saved:+; its log: $saved}"
+fi
+[[ -z "$pid1" ]] || wait "$wpid" || failed=1
+(( failed == 0 )) || exit 0       # a warning above said what is left
+rm -f "$RUN_STATE"
+memguard_stop
+log "Stopped the ranks $where; their GPU memory is free again"
